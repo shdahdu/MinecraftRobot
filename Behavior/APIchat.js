@@ -2,7 +2,7 @@ const OpenAI = require('openai')
 
 const BASE_URL = 'https://api.deepseek.com'
 const MODEL = 'deepseek-chat'
-const KEY = ('sk-70ed9822ae874a1cbe0a9ab11e5811dd').trim()
+const KEY = ('').trim()
 
 let client = new OpenAI({ apiKey: KEY, baseURL: BASE_URL })
 
