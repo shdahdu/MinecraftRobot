@@ -1,0 +1,2 @@
+# MinecraftRobot
+一个基于Mineflayer开发的MC智能小机器人
