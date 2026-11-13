@@ -1,11 +1,12 @@
+const { pathfinder, Movements, goals: { GoalNear } } = require('mineflayer-pathfinder')
 
 let botRef = null
 let chopping = false
 let chopBusy = false
 let chopTimer = null
+let navStall = 0
 
 const LOG_NAMES = new Set([
-    
     'oak_log', 'spruce_log', 'birch_log', 'jungle_log',
     'acacia_log', 'dark_oak_log', 'mangrove_log', 'cherry_log',
     'stripped_oak_log', 'stripped_spruce_log', 'stripped_birch_log',
@@ -41,15 +42,15 @@ async function equipBestAxe() {
     await botRef.equip(axes[0], 'hand')
 }
 
-//以自身为中心扫描 6 格范围内的所有原木方块， 
-function findLogBlocks() {
+// 扫描指定半径内所有原木，按到机器人的距离排序（近的在前）
+function findLogBlocks(range = 20) {
     if (!botRef) return []
     const myPos = botRef.entity.position
     const logs = []
 
-    for (let x = -6; x <= 6; x++) {
+    for (let x = -range; x <= range; x++) {
         for (let y = -1; y <= 15; y++) {
-            for (let z = -6; z <= 6; z++) {
+            for (let z = -range; z <= range; z++) {
                 const block = botRef.blockAt(myPos.offset(x, y, z))
                 if (isLogBlock(block)) {
                     logs.push(block)
@@ -58,11 +59,30 @@ function findLogBlocks() {
         }
     }
 
-    
-    logs.sort((a, b) => a.position.y - b.position.y)
+    logs.sort((a, b) =>
+        botRef.entity.position.distanceTo(a.position) - botRef.entity.position.distanceTo(b.position)
+    )
     return logs
 }
 
+// 用 pathfinder 走到指定坐标，20 秒超时返回 false
+async function walkTo(x, y, z) {
+    const goal = new GoalNear(x, y, z, 2)
+    const timeout = new Promise((resolve) => setTimeout(() => resolve('timeout'), 20000))
+    try {
+        const result = await Promise.race([botRef.pathfinder.goto(goal), timeout])
+        if (result === 'timeout') {
+            botRef.pathfinder.setGoal(null)
+            console.log('[logger] 寻路超时')
+            return false
+        }
+        return true
+    } catch (err) {
+        botRef.pathfinder.setGoal(null)
+        console.log('[logger] 寻路失败:', err.message)
+        return false
+    }
+}
 
 async function chopLoop() {
     if (!chopping || !botRef) return
@@ -73,50 +93,53 @@ async function chopLoop() {
 
     chopBusy = true
     try {
-    
         await equipBestAxe()
 
-        //  扫描范围内所有原木
-        const logs = findLogBlocks()
+        // 大范围搜索最近的木头
+        const logs = findLogBlocks(32)
 
         if (logs.length === 0) {
-            console.log('[logger] 范围内没有原木，停止砍树')
-            botRef.chat('没有可砍的树木了')
+            console.log('[logger] 附近没有木头，停止砍树')
             chopping = false
             return
         }
 
-        console.log(`[logger] 发现 ${logs.length} 块原木，开始砍伐`)
+        const target = logs[0]
+        const dist = botRef.entity.position.distanceTo(target.position)
 
-        let broken = 0
-        for (const block of logs) {
-            if (!chopping || !botRef) break
+        // 太远就主动走过去
+        if (dist > 4.5) {
+            console.log(`[logger] 发现 ${target.name}，距离约 ${Math.round(dist)} 格，前往`)
+            const groundY = Math.floor(botRef.entity.position.y)
+            const ok = await walkTo(target.position.x, groundY, target.position.z)
+            if (!ok) {
+                chopping = false
+                return
+            }
+            // 走过去后仍够不到（比如树在高处），累计次数，超过 3 次就放弃
+            if (botRef.entity.position.distanceTo(target.position) > 4.5) {
+                navStall++
+                if (navStall >= 3) {
+                    console.log('[logger] 多次前往仍够不到木头，放弃')
+                    botRef.chat('够不到那棵树，放弃了')
+                    chopping = false
+                    return
+                }
+            } else {
+                navStall = 0
+            }
+            chopTimer = setTimeout(chopLoop, 300)
+            return
+        }
 
-         
-            const current = botRef.blockAt(block.position)
-            if (!current || !isLogBlock(current)) continue
-
-            
-            if (!botRef.canDigBlock(current)) continue
-
-            
-            await equipBestAxe()
-
-            
+        // 够得着就直接砍
+        const current = botRef.blockAt(target.position)
+        if (current && isLogBlock(current) && botRef.canDigBlock(current)) {
             await botRef.lookAt(current.position.offset(0.5, 0.5, 0.5))
             await botRef.dig(current)
-            broken++
-            console.log(`[logger] 砍掉: ${current.name} @ (${current.position.x}, ${current.position.y}, ${current.position.z})`)
+            navStall = 0
         }
-
-        if (broken > 0) {
-            console.log(`[logger] 本轮砍掉 ${broken} 块，继续扫描...`)
-            chopping = true
-            chopTimer = setTimeout(chopLoop, 800)
-        } else {
-            console.log('[logger] 本轮没有砍到原木')
-            chopping = false
-        }
+        chopTimer = setTimeout(chopLoop, 300)
     } catch (err) {
         console.log('[logger] 错误:', err.message)
         chopping = false
@@ -127,6 +150,10 @@ async function chopLoop() {
 
 function setupLogger(bot) {
     botRef = bot
+
+    // 加载寻路插件，用于主动前往木头
+    if (!bot.pathfinder) bot.loadPlugin(pathfinder)
+    bot.pathfinder.setMovements(new Movements(bot))
 
     bot.on('chat', (username, message) => {
         if (message === 'chop') {
@@ -144,6 +171,7 @@ function setupLogger(bot) {
             chopping = false
             clearTimeout(chopTimer)
             chopTimer = null
+            botRef.pathfinder?.setGoal(null)
             bot.chat('停止砍树')
             console.log('[logger] 停止砍树')
         }
@@ -156,6 +184,7 @@ function stopChopping() {
         clearTimeout(chopTimer)
         chopTimer = null
     }
+    if (botRef && botRef.pathfinder) botRef.pathfinder.setGoal(null)
 }
 
 function isChopping() {
@@ -163,3 +192,4 @@ function isChopping() {
 }
 
 module.exports = { setupLogger, stopChopping, isChopping }
+
